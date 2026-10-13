@@ -3853,48 +3853,124 @@ if (document.addEventListener) {
     });
 }
 </script>
-
 <script>
-/* ==================================================================
-   ANTI-SCREENSHOT.JS  —  v5.4.0  (STREAM API · RECORDER-GUARD)
-   ------------------------------------------------------------------
-   JS-ONLY. Drop the whole <script> block into Blogger / GitHub Pages.
-   Auto-protects any element with:   data-anti-screenshot
+/* ══════════════════════════════════════════════════════════════════════
+   ANTI-SCREENSHOT PREMIUM WIDGET  —  v8.0.0
+   ──────────────────────────────────────────────────────────────────────
+   Production-grade, JS-only, cross-device screen-capture guard.
+   Works on GitHub Pages · Blogger · any static host.
 
-   Dart-style API (mirrors NoScreenshot.instance):
-
-     var _ns = NoScreenshot.instance;
-
-     // 1. Subscribe to the shared event stream
-     var sub = _ns.screenshotStream.listen(function (snapshot) {
-       if (snapshot.isScreenRecording) {
-         console.log('Screen is being recorded!');
-       }
-       if (snapshot.isScreenshot) {
-         console.log('Screenshot detected:', snapshot.screenshotPath);
-       }
-     });
-
-     // 2. Start recording-monitoring
-     _ns.startScreenRecordingListening().then(function () { ... });
-
-     // 3. Stop recording-monitoring
-     _ns.stopScreenRecordingListening().then(function () { ... });
-
-     // 4. Cancel subscription
-     sub.cancel();
-   ================================================================== */
+   ▸ Auto-protects any element with:  data-anti-screenshot
+   ▸ Auto-arms on load · no user interaction required
+   ▸ Blocks: screenshots, screen recording, DevTools, capture APIs
+   ▸ Device matrix: Mobile · Tablet · Desktop
+   ▸ Zero dependencies · ~18 KB minified-ready
+   ══════════════════════════════════════════════════════════════════════ */
 (function (global) {
   'use strict';
 
-  var STYLE_ID = 'as-style-v54';
-  var VERSION  = '5.4.0';
+  if (global.__AS_PREMIUM__) return;                       // single instance
+  global.__AS_PREMIUM__ = true;
 
-  var OverlayMode = Object.freeze({ blur:'blur', secure:'secure', color:'color' });
+  /* ────────────────────────────────────────────────────────────────
+     CONSTANTS
+     ──────────────────────────────────────────────────────────────── */
+  var VERSION    = '8.0.0';
+  var STYLE_ID   = 'as-premium-style';
+  var SHIELD_ID  = 'as-premium-shield';
 
-  /* ═══════════════════════════════════════════════════════════════
-     1 · DART-STYLE STREAM
-     ═══════════════════════════════════════════════════════════════ */
+  var OverlayMode = Object.freeze({
+    blur:   'blur',
+    secure: 'secure',
+    color:  'color'
+  });
+
+  /* ────────────────────────────────────────────────────────────────
+     DEVICE FINGERPRINT
+     ──────────────────────────────────────────────────────────────── */
+  var Device = (function () {
+    var ua        = navigator.userAgent || '';
+    var platform  = navigator.platform || '';
+    var maxTouch  = navigator.maxTouchPoints || 0;
+    var isIPad    = /iPad/.test(ua) || (platform === 'MacIntel' && maxTouch > 1);
+    var isIOS     = /iPad|iPhone|iPod/.test(ua) || isIPad;
+    var isAndroid = /Android/.test(ua);
+    var isMobile  = /Mobi|Android|iPhone|iPod|BlackBerry|IEMobile|Opera Mini/i.test(ua) || (isIOS && !isIPad);
+    var isTablet  = isIPad || (/Android/.test(ua) && !/Mobile/.test(ua)) || /Tablet|PlayBook|Silk/i.test(ua);
+    var isDesktop = !isMobile && !isTablet;
+
+    var os = isIOS ? (isIPad ? 'iPadOS' : 'iOS')
+           : isAndroid ? 'Android'
+           : /Mac/.test(platform) ? 'macOS'
+           : /Win/.test(platform) ? 'Windows'
+           : /Linux/.test(platform) ? 'Linux'
+           : 'Unknown';
+
+    var coarse = false, hover = true;
+    try {
+      coarse = global.matchMedia && global.matchMedia('(pointer: coarse)').matches;
+      hover  = global.matchMedia && global.matchMedia('(hover: hover)').matches;
+    } catch (e) {}
+
+    var type = isTablet ? 'tablet' : (isMobile ? 'mobile' : 'desktop');
+
+    return {
+      type: type, os: os,
+      isMobile: isMobile, isTablet: isTablet, isDesktop: isDesktop,
+      isIOS: isIOS, isIPad: isIPad, isAndroid: isAndroid,
+      maxTouchPoints: maxTouch,
+      coarsePointer: coarse, hasHover: hover,
+      isTouch: maxTouch > 0 || coarse,
+      summary: type + '/' + os
+    };
+  })();
+
+  /* ────────────────────────────────────────────────────────────────
+     CONFIG
+     ──────────────────────────────────────────────────────────────── */
+  var CONFIG = {
+    cooldownMs:                 2500,   // minimum lock time after detection
+    maxAutoUnlockMs:            6000,   // hard cap on auto-unlock
+    realtimePollMs:             80,     // state-loop frequency
+    clipboardPollMs:            700,    // clipboard image watcher
+    denyGetDisplayMedia:        true,   // block screen-capture API
+    denyScreenUserMedia:        true,   // block screen-source getUserMedia
+    lockOnFocusLoss:            true,
+    lockOnHidden:               true,
+    lockOnMultiTouch:           true,
+    lockOnDevTools:             true,
+    lockOnOrientationChange:    true,
+    lockOnStylusButton:         true,
+    watchClipboard:             true,
+    autoArm:                    true,
+    mode:                       OverlayMode.blur,
+    blurRadius:                 28,
+    color:                      0xFF000000
+  };
+
+  /* ────────────────────────────────────────────────────────────────
+     INTERNAL STATE
+     ──────────────────────────────────────────────────────────────── */
+  var shieldEl         = null;
+  var locked           = false;
+  var manualLock       = false;
+  var restoreTimer     = null;
+  var unlockSchedule   = null;
+  var listenersReady   = false;
+  var everFocused      = false;
+  var autoArmed        = false;
+  var orientationLast  = (typeof screen !== 'undefined' && screen.orientation) ? screen.orientation.type : '';
+  var printScrCooldown = 0;
+
+  var protectedEls = new WeakSet();
+  var elementList  = [];
+
+  var recListening = { active: false, pollTimer: null, lastCount: -1 };
+  var clipWatch    = { timer: null, lastHash: '', granted: false };
+
+  /* ────────────────────────────────────────────────────────────────
+     DART-STYLE STREAM
+     ──────────────────────────────────────────────────────────────── */
   function Stream() {
     this._listeners = new Set();
     this._closed    = false;
@@ -3902,23 +3978,13 @@ if (document.addEventListener) {
   Stream.prototype.listen = function (onData, onError, onDone) {
     var self = this;
     var listener = { onData: onData, onError: onError, onDone: onDone };
-
     if (this._closed) {
       if (onDone) setTimeout(function () { try { onDone(); } catch (e) {} }, 0);
-      return { cancel: function () { return Promise.resolve(); },
-               pause:  function () {},
-               resume: function () {} };
+      return { cancel: function () { return Promise.resolve(); }, get isCancelled() { return true; } };
     }
-
     this._listeners.add(listener);
-
     return {
-      cancel: function () {
-        self._listeners.delete(listener);
-        return Promise.resolve();
-      },
-      pause:  function () {},
-      resume: function () {},
+      cancel: function () { self._listeners.delete(listener); return Promise.resolve(); },
       get isCancelled() { return !self._listeners.has(listener); }
     };
   };
@@ -3935,89 +4001,46 @@ if (document.addEventListener) {
     this._listeners.forEach(function (l) { try { if (l.onDone) l.onDone(); } catch (e) {} });
     this._listeners.clear();
   };
-  Stream.prototype.hasListeners = function () { return this._listeners.size > 0; };
-  Stream.prototype.get listenerCount() { return this._listeners.size; }
+  Object.defineProperty(Stream.prototype, 'listenerCount', {
+    get: function () { return this._listeners.size; }
+  });
 
-  /* ═══════════════════════════════════════════════════════════════
-     2 · SNAPSHOT  (now carries isScreenRecording / isScreenshot)
-     ═══════════════════════════════════════════════════════════════ */
-  function Snapshot(opts) {
-    opts = opts || {};
-    this.screenshotPath    = opts.screenshotPath || '';
-    this.timestamp         = opts.timestamp || Date.now();
-    this.sourceApp         = opts.sourceApp || 'browser';
-    this.isScreenshot      = opts.isScreenshot === true;
-    this.isScreenRecording = opts.isScreenRecording === true;
-    this.type              = opts.type || 'unknown';   /* 'screenshot' | 'recording-start' | 'recording-stop' */
-    this.reason            = opts.reason || '';
-  }
-
-  /* ═══════════════════════════════════════════════════════════════
-     3 · CONFIG
-     ═══════════════════════════════════════════════════════════════ */
-  var CONFIG = {
-    cooldownMs:                 3500,
-    denyGetDisplayMedia:        true,
-    lockOnFocusLoss:            true,
-    lockOnHidden:               true,
-    lockOnMultiTouch:           true,
-    pollIntervalMs:             100,
-    autoStartRecordingListener: false   /* ← set true to auto-arm */
-  };
-
-  /* ═══════════════════════════════════════════════════════════════
-     4 · MODULE STATE
-     ═══════════════════════════════════════════════════════════════ */
-  var instances            = [];
-  var shieldEl             = null;
-  var locked               = false;
-  var manualLockActive     = false;
-  var restoreTimer         = null;
-  var unlockSchedule       = null;
-  var globalListenersReady = false;
-  var everFocused          = false;
-  var userInteracted       = false;
-
-  var currentMode       = OverlayMode.blur;
-  var currentBlurRadius = 28;
-  var currentColor      = 0xFF000000;
-
-  /* shared stream — created once, never closed */
   var screenshotStream = new Stream();
 
-  /* legacy callbacks (kept) */
-  var callbacks = {
-    onScreenshotDetected:     null,
-    onScreenRecordingStarted: null,
-    onScreenRecordingStopped: null
-  };
-  var callbacksActive = false;
+  /* ────────────────────────────────────────────────────────────────
+     SNAPSHOT
+     ──────────────────────────────────────────────────────────────── */
+  function Snapshot(o) {
+    o = o || {};
+    this.screenshotPath    = o.screenshotPath || '';
+    this.timestamp         = o.timestamp || Date.now();
+    this.sourceApp         = o.sourceApp || 'browser';
+    this.deviceType        = o.deviceType || Device.type;
+    this.deviceOS          = o.deviceOS   || Device.os;
+    this.isScreenshot      = o.isScreenshot === true;
+    this.isScreenRecording = o.isScreenRecording === true;
+    this.type              = o.type || 'unknown';
+    this.reason            = o.reason || '';
+    this.auto              = o.auto === true;
+  }
 
-  /* recording-listening gate */
-  var recListening = {
-    active:          false,
-    devicePollTimer: null,
-    lastDeviceCount: -1
-  };
-
-  /* ═══════════════════════════════════════════════════════════════
-     5 · RECORDER GUARD
-     ═══════════════════════════════════════════════════════════════ */
-  var RecorderGuard = (function () {
-    var streams       = new Set();
-    var recorders     = new Set();
+  /* ────────────────────────────────────────────────────────────────
+     RECORDER GUARD
+     ──────────────────────────────────────────────────────────────── */
+  var Guard = (function () {
+    var streams   = new Set();
+    var recorders = new Set();
     var cooldownUntil = 0;
 
-    function pruneSet() {
+    function prune() {
       streams.forEach(function (s) {
         var tracks = s.getTracks ? s.getTracks() : [];
-        var live = tracks.some(function (t) { return t.readyState === 'live'; });
-        if (!live) streams.delete(s);
+        if (!tracks.some(function (t) { return t.readyState === 'live'; })) streams.delete(s);
       });
       recorders.forEach(function (r) { if (r.state === 'inactive') recorders.delete(r); });
     }
-    function hasActiveCapture() {
-      pruneSet();
+    function active() {
+      prune();
       if (streams.size > 0) return true;
       var any = false;
       recorders.forEach(function (r) {
@@ -4027,96 +4050,99 @@ if (document.addEventListener) {
     }
     function reasons() {
       var out = [];
-      if (hasActiveCapture())            out.push('active-capture');
-      if (document.hidden)               out.push('document-hidden');
-      if (!safeHasFocus())               out.push('no-focus');
-      if (Date.now() < cooldownUntil)    out.push('cooldown');
+      if (active())                  out.push('active-capture');
+      if (document.hidden)           out.push('document-hidden');
+      if (!hasFocus())               out.push('no-focus');
+      if (Date.now() < cooldownUntil) out.push('cooldown');
       return out;
     }
     return {
-      trackStream:      function (s) { if (s) streams.add(s); },
-      trackRecorder:    function (r) { if (r) recorders.add(r); },
-      hasActiveCapture: hasActiveCapture,
+      trackStream:     function (s) { if (s) streams.add(s); },
+      trackRecorder:   function (r) { if (r) recorders.add(r); },
+      hasActive:       active,
       shouldStayLocked: function () { return reasons().length > 0; },
-      getReasons:       function () { return reasons(); },
-      startCooldown:    function () { cooldownUntil = Date.now() + CONFIG.cooldownMs; },
-      clearCooldown:    function () { cooldownUntil = 0; },
+      reasons:         reasons,
+      startCooldown:   function () { cooldownUntil = Date.now() + CONFIG.cooldownMs; },
+      clearCooldown:   function () { cooldownUntil = 0; },
       _streams: streams,
       _recorders: recorders
     };
   })();
 
-  function safeHasFocus() {
+  function hasFocus() {
     try { return document.hasFocus ? document.hasFocus() : true; }
     catch (e) { return true; }
   }
 
-  /* ═══════════════════════════════════════════════════════════════
-     6 · CSS
-     ═══════════════════════════════════════════════════════════════ */
+  /* ────────────────────────────────────────────────────────────────
+     STYLES
+     ──────────────────────────────────────────────────────────────── */
   var CSS = [
-    'html.as-locked[data-as-mode="blur"] .as-protected{',
-    '  filter:blur(var(--as-blur,28px)) brightness(.35) saturate(.55)!important;',
-    '  -webkit-filter:blur(var(--as-blur,28px)) brightness(.35) saturate(.55)!important;}',
-    'html.as-locked[data-as-mode="secure"] .as-protected{',
+    'html.as-lock[data-as-mode="blur"] .as-guarded{',
+    '  filter:blur(var(--as-blur,28px)) brightness(.32) saturate(.5)!important;',
+    '  -webkit-filter:blur(var(--as-blur,28px)) brightness(.32) saturate(.5)!important;}',
+    'html.as-lock[data-as-mode="secure"] .as-guarded{',
     '  filter:blur(60px) brightness(0) saturate(0)!important;',
     '  -webkit-filter:blur(60px) brightness(0) saturate(0)!important;}',
-    'html.as-locked[data-as-mode="color"] .as-protected{',
+    'html.as-lock[data-as-mode="color"] .as-guarded{',
     '  filter:none!important; visibility:hidden!important;}',
-    'html.as-locked .as-protected{',
-    '  pointer-events:none!important; user-select:none!important;',
-    '  -webkit-user-select:none!important;}',
-    '.as-shield{',
+    'html.as-lock .as-guarded{',
+    '  pointer-events:none!important;',
+    '  user-select:none!important; -webkit-user-select:none!important;}',
+
+    '#as-premium-shield{',
     '  position:fixed; inset:0; z-index:2147483647;',
     '  display:flex; align-items:center; justify-content:center;',
     '  padding:24px; text-align:center; color:#fff;',
-    '  background:rgba(8,11,18,.94);',
-    '  -webkit-backdrop-filter:blur(24px) saturate(.5);',
-    '  backdrop-filter:blur(24px) saturate(.5);',
+    '  background:rgba(6,9,15,.96);',
+    '  -webkit-backdrop-filter:blur(28px) saturate(.45);',
+    '  backdrop-filter:blur(28px) saturate(.45);',
     '  font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;',
     '  user-select:none; -webkit-user-select:none; -webkit-touch-callout:none;',
     '  opacity:0; visibility:hidden; pointer-events:none;',
-    '  transition:opacity .15s ease, visibility 0s linear .15s;}',
-    'html.as-locked .as-shield{',
+    '  transition:opacity .16s ease, visibility 0s linear .16s;}',
+    'html.as-lock #as-premium-shield{',
     '  opacity:1; visibility:visible; pointer-events:auto;',
-    '  transition:opacity .15s ease, visibility 0s linear 0s;}',
-    'html.as-locked[data-as-mode="color"] .as-shield{',
+    '  transition:opacity .16s ease, visibility 0s linear 0s;}',
+    'html.as-lock[data-as-mode="color"] #as-premium-shield{',
     '  background:var(--as-color,#000)!important;',
     '  -webkit-backdrop-filter:none!important; backdrop-filter:none!important;}',
-    '.as-shield__box{max-width:440px; animation:as-pop .3s cubic-bezier(.34,1.56,.64,1);}',
-    '.as-shield__icon{',
-    '  display:block; width:72px; height:72px; margin:0 auto 20px;',
+
+    '.as-p-shield__box{max-width:440px; animation:asP-pop .32s cubic-bezier(.34,1.56,.64,1);}',
+    '.as-p-shield__icon{',
+    '  display:block; width:76px; height:76px; margin:0 auto 22px;',
     '  border-radius:50%; background:rgba(255,90,106,.14);',
     '  border:2px solid rgba(255,90,106,.5); position:relative;',
-    '  animation:as-beat 1.4s ease-in-out infinite;}',
-    '.as-shield__icon::before{',
+    '  animation:asP-beat 1.5s ease-in-out infinite;}',
+    '.as-p-shield__icon::before{',
     '  content:""; position:absolute; inset:0; margin:auto;',
-    '  width:32px; height:32px;',
+    '  width:34px; height:34px;',
     '  background:no-repeat center/contain;',
     '  background-image:url("data:image/svg+xml;utf8,<svg xmlns=\'http://www.w3.org/2000/svg\' viewBox=\'0 0 24 24\' fill=\'none\' stroke=\'%23ff5a6a\' stroke-width=\'2\' stroke-linecap=\'round\' stroke-linejoin=\'round\'><path d=\'M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z\'/></svg>");}',
-    '@keyframes as-beat{0%,100%{transform:scale(1)}50%{transform:scale(1.06)}}',
-    '.as-shield__title{font-size:1.2rem; font-weight:700;}',
-    '.as-shield__sub{margin-top:10px; font-size:.88rem; line-height:1.55; color:rgba(255,255,255,.72);}',
-    '.as-shield__why{margin-top:8px; font-size:.72rem; color:rgba(255,179,189,.75); font-family:ui-monospace,monospace;}',
-    '.as-shield__badge{',
+    '@keyframes asP-beat{0%,100%{transform:scale(1)}50%{transform:scale(1.06)}}',
+    '.as-p-shield__title{font-size:1.22rem; font-weight:700; letter-spacing:-.01em;}',
+    '.as-p-shield__sub{margin-top:10px; font-size:.88rem; line-height:1.55; color:rgba(255,255,255,.72);}',
+    '.as-p-shield__why{margin-top:8px; font-size:.72rem; color:rgba(255,179,189,.72); font-family:ui-monospace,monospace; word-break:break-word;}',
+    '.as-p-shield__badge{',
     '  display:inline-flex; align-items:center; gap:7px; margin-top:20px;',
     '  font-size:.65rem; font-weight:800; letter-spacing:.2em;',
     '  color:#ffb3bd; background:rgba(255,90,106,.12);',
     '  border:1px solid rgba(255,90,106,.35);',
     '  padding:6px 14px; border-radius:999px;}',
-    '.as-shield__badge::before{',
+    '.as-p-shield__badge::before{',
     '  content:""; width:8px; height:8px; border-radius:50%; background:#ff5a6a;',
     '  box-shadow:0 0 8px #ff5a6a;}',
-    '@keyframes as-pop{from{transform:scale(.9); opacity:0} to{transform:scale(1); opacity:1}}',
+    '@keyframes asP-pop{from{transform:scale(.9); opacity:0} to{transform:scale(1); opacity:1}}',
+
     '@media print{',
-    '  html.as-locked .as-protected{filter:none!important; opacity:.05!important;}',
-    '  html.as-locked .as-shield{',
+    '  html.as-lock .as-guarded{filter:none!important; opacity:.05!important;}',
+    '  html.as-lock #as-premium-shield{',
     '    position:static!important; opacity:1!important; visibility:visible!important;',
     '    background:#fff!important; color:#000!important;',
     '    -webkit-backdrop-filter:none!important; backdrop-filter:none!important;}',
-    '  html.as-locked .as-shield__icon{background:#fee; border-color:#c00;}',
-    '  html.as-locked .as-shield__sub{color:#555;}',
-    '  html.as-locked .as-shield__badge{color:#c00; border-color:#c00; background:#fee;}',
+    '  html.as-lock .as-p-shield__icon{background:#fee; border-color:#c00;}',
+    '  html.as-lock .as-p-shield__sub{color:#555;}',
+    '  html.as-lock .as-p-shield__badge{color:#c00; border-color:#c00; background:#fee;}',
     '}'
   ].join('\n');
 
@@ -4137,105 +4163,111 @@ if (document.addEventListener) {
     return 'rgba(' + r + ',' + g + ',' + b + ',' + a.toFixed(3) + ')';
   }
 
-  function applyMode(mode, blurRadius, color) {
-    if (mode != null) currentMode = mode;
-    if (blurRadius != null) currentBlurRadius = blurRadius;
-    if (color != null) currentColor = color;
+  function applyMode(mode, blur, color) {
+    if (mode  != null) CONFIG.mode       = mode;
+    if (blur  != null) CONFIG.blurRadius = blur;
+    if (color != null) CONFIG.color      = color;
     var html = document.documentElement;
-    html.setAttribute('data-as-mode', currentMode);
-    html.style.setProperty('--as-blur',  currentBlurRadius + 'px');
-    html.style.setProperty('--as-color', argbToCss(currentColor));
+    html.setAttribute('data-as-mode', CONFIG.mode);
+    html.style.setProperty('--as-blur',  CONFIG.blurRadius + 'px');
+    html.style.setProperty('--as-color', argbToCss(CONFIG.color));
   }
 
   function buildShield() {
     if (shieldEl) return shieldEl;
     shieldEl = document.createElement('div');
-    shieldEl.className = 'as-shield';
+    shieldEl.id = SHIELD_ID;
     shieldEl.setAttribute('role', 'alert');
     shieldEl.setAttribute('aria-live', 'assertive');
+    shieldEl.setAttribute('aria-hidden', 'true');
     shieldEl.innerHTML =
-      '<div class="as-shield__box">' +
-        '<div class="as-shield__icon"></div>' +
-        '<div class="as-shield__title">Content Protected</div>' +
-        '<div class="as-shield__sub">Screenshots and screen recording are not allowed on this page.</div>' +
-        '<div class="as-shield__why" data-as-why></div>' +
-        '<div class="as-shield__badge">PROTECTED</div>' +
+      '<div class="as-p-shield__box">' +
+        '<div class="as-p-shield__icon"></div>' +
+        '<div class="as-p-shield__title">Content Protected</div>' +
+        '<div class="as-p-shield__sub">Screenshots and screen recording are blocked on this page.</div>' +
+        '<div class="as-p-shield__why" data-as-why></div>' +
+        '<div class="as-p-shield__badge">PROTECTED</div>' +
       '</div>';
     (document.body || document.documentElement).appendChild(shieldEl);
     return shieldEl;
   }
 
-  function refreshShieldReason() {
+  function refreshWhy() {
     if (!shieldEl) return;
     var why = shieldEl.querySelector('[data-as-why]');
     if (!why) return;
-    var r = RecorderGuard.getReasons();
+    var r = Guard.reasons();
     why.textContent = r.length ? 'reason: ' + r.join(', ') : '';
   }
 
   function fireStateChange(reason) {
     try {
       global.dispatchEvent(new CustomEvent('as-statechange', {
-        detail: { locked: locked, reason: reason, mode: currentMode,
-                  reasons: RecorderGuard.getReasons() }
+        detail: { locked: locked, reason: reason, mode: CONFIG.mode, reasons: Guard.reasons() }
       }));
     } catch (e) {}
   }
 
-  /* ═══════════════════════════════════════════════════════════════
-     7 · LOCK / UNLOCK  (cooldown-aware)
-     ═══════════════════════════════════════════════════════════════ */
+  /* ────────────────────────────────────────────────────────────────
+     LOCK / UNLOCK
+     ──────────────────────────────────────────────────────────────── */
   function lock(reason, autoUnlockMs, persist) {
-    if (!globalListenersReady) attachGlobalListeners();
+    if (!listenersReady) attachListeners();
     if (!shieldEl) buildShield();
 
     var wasLocked = locked;
     locked = true;
-    if (persist) manualLockActive = true;
-    document.documentElement.classList.add('as-locked');
+    if (persist) manualLock = true;
+    document.documentElement.classList.add('as-lock');
+    if (shieldEl) shieldEl.setAttribute('aria-hidden', 'false');
 
     clearTimeout(unlockSchedule);
     clearTimeout(restoreTimer);
 
     if (!persist) {
-      RecorderGuard.startCooldown();
-      if (autoUnlockMs) restoreTimer = setTimeout(tryUnlock, autoUnlockMs);
+      Guard.startCooldown();
+      var ms = autoUnlockMs || 0;
+      if (ms > 0) {
+        if (ms > CONFIG.maxAutoUnlockMs) ms = CONFIG.maxAutoUnlockMs;
+        restoreTimer = setTimeout(tryUnlock, ms);
+      }
     }
 
     if (!wasLocked) {
       try {
         global.dispatchEvent(new CustomEvent('as-violation', {
-          detail: { reason: reason, mode: currentMode,
-                    reasons: RecorderGuard.getReasons() }
+          detail: { reason: reason, mode: CONFIG.mode, reasons: Guard.reasons() }
         }));
       } catch (e) {}
     }
-    refreshShieldReason();
+    refreshWhy();
     fireStateChange(reason);
   }
 
   function tryUnlock() {
-    if (manualLockActive) return;
-    if (RecorderGuard.shouldStayLocked()) {
+    if (manualLock) return;
+    if (Guard.shouldStayLocked()) {
       clearTimeout(unlockSchedule);
-      unlockSchedule = setTimeout(tryUnlock, 250);
-      refreshShieldReason();
+      unlockSchedule = setTimeout(tryUnlock, 200);
+      refreshWhy();
       return;
     }
     if (!locked) return;
     locked = false;
-    document.documentElement.classList.remove('as-locked');
+    document.documentElement.classList.remove('as-lock');
+    if (shieldEl) shieldEl.setAttribute('aria-hidden', 'true');
     fireStateChange('unlock');
   }
 
   function unlock() {
     clearTimeout(restoreTimer);
     clearTimeout(unlockSchedule);
-    manualLockActive = false;
-    RecorderGuard.clearCooldown();
+    manualLock = false;
+    Guard.clearCooldown();
     if (!locked) return;
     locked = false;
-    document.documentElement.classList.remove('as-locked');
+    document.documentElement.classList.remove('as-lock');
+    if (shieldEl) shieldEl.setAttribute('aria-hidden', 'true');
     fireStateChange('unlock');
   }
 
@@ -4254,181 +4286,147 @@ if (document.addEventListener) {
     } catch (e) {}
   }
 
-  function isProtectedNode(node) {
+  function isGuarded(node) {
     var t = node;
     while (t && t.nodeType === 1) {
-      if (t.classList && t.classList.contains('as-protected')) return true;
+      if (t.classList && t.classList.contains('as-guarded')) return true;
       if (t === document.body) break;
       t = t.parentNode;
     }
     return false;
   }
 
-  /* ═══════════════════════════════════════════════════════════════
-     8 · EVENT EMISSION  —  everything routes through here
-     ═══════════════════════════════════════════════════════════════ */
+  /* ────────────────────────────────────────────────────────────────
+     EVENT EMISSION
+     ──────────────────────────────────────────────────────────────── */
   function emit(snapshot) {
-    /* 1 · push to the Dart-style stream */
     try { screenshotStream.add(snapshot); } catch (e) {}
-
-    /* 2 · legacy callback dispatch */
-    if (callbacksActive) {
-      try {
-        if (snapshot.isScreenshot && typeof callbacks.onScreenshotDetected === 'function') {
-          callbacks.onScreenshotDetected(snapshot);
-        }
-        if (snapshot.type === 'recording-start' && typeof callbacks.onScreenRecordingStarted === 'function') {
-          callbacks.onScreenRecordingStarted(snapshot);
-        }
-        if (snapshot.type === 'recording-stop' && typeof callbacks.onScreenRecordingStopped === 'function') {
-          callbacks.onScreenRecordingStopped(snapshot);
-        }
-      } catch (e) { console.error('[AntiScreenshot] callback threw:', e); }
-    }
-
-    /* 3 · DOM event mirror */
-    try {
-      global.dispatchEvent(new CustomEvent('as-snapshot', { detail: snapshot }));
-    } catch (e) {}
+    try { global.dispatchEvent(new CustomEvent('as-snapshot', { detail: snapshot })); } catch (e) {}
   }
-
   function emitScreenshot(path, source, reason) {
     emit(new Snapshot({
-      screenshotPath:    path || '(browser: path unavailable)',
-      timestamp:         Date.now(),
-      sourceApp:         source || 'browser',
-      isScreenshot:      true,
-      isScreenRecording: false,
-      type:              'screenshot',
-      reason:            reason || ''
+      screenshotPath: path || '(unavailable)',
+      sourceApp: source, isScreenshot: true,
+      type: 'screenshot', reason: reason, auto: true
     }));
   }
-  function emitRecordingStarted(source, reason) {
+  function emitRecStarted(source, reason) {
     emit(new Snapshot({
-      timestamp:         Date.now(),
-      sourceApp:         source || 'browser',
-      isScreenshot:      false,
-      isScreenRecording: true,
-      type:              'recording-start',
-      reason:            reason || ''
+      sourceApp: source, isScreenRecording: true,
+      type: 'recording-start', reason: reason, auto: true
     }));
   }
-  function emitRecordingStopped(source, reason) {
+  function emitRecStopped(source, reason) {
     emit(new Snapshot({
-      timestamp:         Date.now(),
-      sourceApp:         source || 'browser',
-      isScreenshot:      false,
-      isScreenRecording: true,
-      type:              'recording-stop',
-      reason:            reason || ''
+      sourceApp: source, isScreenRecording: true,
+      type: 'recording-stop', reason: reason, auto: true
     }));
   }
 
-  /* ═══════════════════════════════════════════════════════════════
-     9 · REALTIME ENGINE
-     ═══════════════════════════════════════════════════════════════ */
+  /* ────────────────────────────────────────────────────────────────
+     REALTIME ENGINE
+     ──────────────────────────────────────────────────────────────── */
   var RT = (function () {
-    var active    = false;
-    var rafId     = null;
-    var pollId    = null;
-    var lastFocus = true;
-    var stats     = { startTime:0, frames:0, checks:0, detections:0,
-                      lastReason:null, lastAt:0 };
+    var active = false, rafId = null, pollId = null;
+    var lastFocus = true, lastHidden = false;
+    var stats = { startTime: 0, frames: 0, checks: 0, detections: 0, lastReason: null, lastAt: 0 };
 
-    function hit(reason, label, autoUnlockMs) {
+    function hit(reason, label, ms) {
       stats.detections++;
       stats.lastReason = reason;
       stats.lastAt = Date.now();
       try {
-        global.dispatchEvent(new CustomEvent('as-rt-hit', {
-          detail: { reason: reason, label: label }
-        }));
+        global.dispatchEvent(new CustomEvent('as-hit', { detail: { reason: reason, label: label } }));
       } catch (e) {}
-      lock(reason, autoUnlockMs || 0, false);
+      lock(reason, ms || 0, false);
     }
 
     function tick() {
       if (!active) return;
       stats.frames++;
-      var f = safeHasFocus();
-      if (!f && lastFocus && everFocused && !manualLockActive && !locked) {
-        hit('raf-focus-lost', 'Focus lost (RAF)');
+      var f = hasFocus();
+      if (!f && lastFocus && everFocused && !manualLock && !locked) {
+        hit('raf-focus-lost', 'Focus lost (realtime)');
       }
       lastFocus = f;
-      if (locked && !manualLockActive) refreshShieldReason();
+      if (document.hidden && !lastHidden && !manualLock && !locked) {
+        hit('realtime-hidden', 'Document hidden');
+      }
+      lastHidden = document.hidden;
+      if (locked && !manualLock) refreshWhy();
       rafId = requestAnimationFrame(tick);
     }
 
     function poll() {
       if (!active) return;
       stats.checks++;
-      if (document.hidden && CONFIG.lockOnHidden && !manualLockActive && !locked) {
-        hit('poll-visibility', 'Document hidden (poll)');
+      if (document.hidden && CONFIG.lockOnHidden && !manualLock && !locked) {
+        hit('poll-visibility', 'Document hidden');
       }
       if (!isTyping() && CONFIG.lockOnFocusLoss) {
-        var f = safeHasFocus();
-        if (!f && everFocused && !manualLockActive && !locked) {
-          hit('poll-focus-lost', 'Focus lost (poll)');
+        if (!hasFocus() && everFocused && !manualLock && !locked) {
+          hit('poll-focus-lost', 'Focus lost');
         }
       }
-      if (locked && !manualLockActive && !RecorderGuard.shouldStayLocked()) tryUnlock();
-    }
-
-    function start() {
-      if (active) return;
-      active = true;
-      stats.startTime = Date.now();
-      lastFocus = safeHasFocus();
-      rafId  = requestAnimationFrame(tick);
-      pollId = setInterval(poll, CONFIG.pollIntervalMs);
-      try { global.dispatchEvent(new CustomEvent('as-rt-start')); } catch (e) {}
-    }
-    function stop() {
-      if (!active) return;
-      active = false;
-      if (rafId)  cancelAnimationFrame(rafId);
-      if (pollId) clearInterval(pollId);
-      rafId = pollId = null;
-      try { global.dispatchEvent(new CustomEvent('as-rt-stop')); } catch (e) {}
+      if (locked && !manualLock && !Guard.shouldStayLocked()) tryUnlock();
     }
 
     return {
-      start: start, stop: stop,
+      start: function () {
+        if (active) return;
+        active = true;
+        stats.startTime = Date.now();
+        lastFocus = hasFocus();
+        lastHidden = document.hidden;
+        rafId  = requestAnimationFrame(tick);
+        pollId = setInterval(poll, CONFIG.realtimePollMs);
+      },
+      stop: function () {
+        if (!active) return;
+        active = false;
+        if (rafId)  cancelAnimationFrame(rafId);
+        if (pollId) clearInterval(pollId);
+        rafId = pollId = null;
+      },
       isActive: function () { return active; },
-      toggle: function () { active ? stop() : start(); },
-      getStats: function () {
+      stats: function () {
         return {
-          active: active, startTime: stats.startTime, frames: stats.frames,
-          checks: stats.checks, detections: stats.detections,
-          lastReason: stats.lastReason, lastAt: stats.lastAt,
+          active: active, frames: stats.frames, checks: stats.checks,
+          detections: stats.detections, lastReason: stats.lastReason, lastAt: stats.lastAt,
           uptime: active ? (Date.now() - stats.startTime) : 0,
-          guardReasons: RecorderGuard.getReasons(),
-          activeStreams: RecorderGuard._streams.size,
-          activeRecorders: RecorderGuard._recorders.size,
-          streamListeners: screenshotStream.listenerCount,
-          recordingListening: recListening.active
+          reasons: Guard.reasons(),
+          streams: Guard._streams.size, recorders: Guard._recorders.size,
+          listeners: screenshotStream.listenerCount,
+          recListening: recListening.active,
+          clipWatching: !!clipWatch.timer,
+          autoArmed: autoArmed,
+          device: Device.summary
         };
       },
       _hit: hit
     };
   })();
 
-  /* ═══════════════════════════════════════════════════════════════
-     10 · KEYBOARD
-     ═══════════════════════════════════════════════════════════════ */
+  /* ────────────────────────────────────────────────────────────────
+     KEYBOARD HANDLERS
+     ──────────────────────────────────────────────────────────────── */
   function onKeyDown(e) {
-    var k    = e.key || '';
-    var code = e.code || '';
-    var mod  = e.ctrlKey || e.metaKey;
+    var k = e.key || '', code = e.code || '', mod = e.ctrlKey || e.metaKey;
 
     if (code === 'PrintScreen' || k === 'PrintScreen') {
       e.preventDefault(); if (e.stopPropagation) e.stopPropagation();
-      RT._hit('printscreen', 'PrintScreen key', 1500);
-      clearClipboard();
-      emitScreenshot('(clipboard)', 'PrintScreen key', 'printscreen');
+      var now = Date.now();
+      if (now - printScrCooldown > 800) {
+        printScrCooldown = now;
+        RT._hit('printscreen', 'PrintScreen', 1500);
+        clearClipboard();
+        emitScreenshot('(clipboard)', 'PrintScreen', 'printscreen');
+      }
       return;
     }
-    if (k === 'F12' && !mod) { e.preventDefault(); RT._hit('devtools', 'F12 / DevTools', 1500); return; }
+    if (k === 'F12' && !mod && CONFIG.lockOnDevTools) {
+      e.preventDefault(); RT._hit('devtools', 'F12 / DevTools', 1500); return;
+    }
     if (mod && !e.altKey && !e.shiftKey && (k === 'p' || k === 'P')) {
       e.preventDefault(); if (e.stopPropagation) e.stopPropagation();
       RT._hit('print-shortcut', 'Ctrl/Cmd+P', 1500); return;
@@ -4438,302 +4436,406 @@ if (document.addEventListener) {
       RT._hit('save-shortcut', 'Ctrl/Cmd+S', 1500); return;
     }
     if (mod && e.shiftKey && /^[345]$/.test(k)) {
+      e.preventDefault(); if (e.stopPropagation) e.stopPropagation();
       RT._hit('mac-screenshot', 'Cmd+Shift+' + k, 2000);
-      emitScreenshot('(macOS)', 'Cmd+Shift+' + k, 'mac-screenshot');
-      return;
+      emitScreenshot('(macOS)', 'Cmd+Shift+' + k, 'mac-screenshot'); return;
     }
     if (mod && e.shiftKey && /^[sS]$/.test(k)) {
+      e.preventDefault(); if (e.stopPropagation) e.stopPropagation();
       RT._hit('screenshot-shortcut', 'Ctrl/Cmd+Shift+S', 2000);
       emitScreenshot('(shortcut)', 'Ctrl/Cmd+Shift+S', 'screenshot-shortcut');
     }
   }
+
   function onKeyUp(e) {
     if (e.key === 'PrintScreen' || e.code === 'PrintScreen') {
       e.preventDefault();
-      RT._hit('printscreen', 'PrintScreen key (up)', 1500);
-      clearClipboard();
-      emitScreenshot('(clipboard)', 'PrintScreen key', 'printscreen');
+      var now = Date.now();
+      if (now - printScrCooldown > 800) {
+        printScrCooldown = now;
+        RT._hit('printscreen', 'PrintScreen (up)', 1500);
+        clearClipboard();
+        emitScreenshot('(clipboard)', 'PrintScreen', 'printscreen');
+      }
     }
   }
 
-  /* ═══════════════════════════════════════════════════════════════
-     11 · CAPTURE-API PATCHING
-     ═══════════════════════════════════════════════════════════════ */
-  var origGetDisplayMedia = null;
-  var origGetUserMedia    = null;
-  var origMediaRecorder   = null;
-  var recordingActive     = false;
+  /* ────────────────────────────────────────────────────────────────
+     CAPTURE-API PATCHING
+     ──────────────────────────────────────────────────────────────── */
+  var origGDM = null, origGUM = null, origMR = null, recordingActive = false;
 
   function patchCaptureApis() {
     if (!navigator.mediaDevices) return;
 
-    if (!origGetDisplayMedia && navigator.mediaDevices.getDisplayMedia) {
-      origGetDisplayMedia = navigator.mediaDevices.getDisplayMedia.bind(navigator.mediaDevices);
-      navigator.mediaDevices.getDisplayMedia = function (constraints) {
+    if (!origGDM && navigator.mediaDevices.getDisplayMedia) {
+      origGDM = navigator.mediaDevices.getDisplayMedia.bind(navigator.mediaDevices);
+      navigator.mediaDevices.getDisplayMedia = function (c) {
         if (CONFIG.denyGetDisplayMedia) {
           RT._hit('screen-capture-denied', 'getDisplayMedia BLOCKED', 0);
           emitScreenshot('(blocked)', 'getDisplayMedia', 'capture-denied');
           return Promise.reject(new DOMException(
             'Screen capture is disabled on this page.', 'NotAllowedError'));
         }
-        return origGetDisplayMedia(constraints).then(function (stream) {
-          RecorderGuard.trackStream(stream);
-          if (!recordingActive) {
-            recordingActive = true;
-            emitRecordingStarted('getDisplayMedia', 'started');
-          }
+        return origGDM(c).then(function (stream) {
+          Guard.trackStream(stream);
+          if (!recordingActive) { recordingActive = true; emitRecStarted('getDisplayMedia', 'started'); }
           var track = stream.getVideoTracks && stream.getVideoTracks()[0];
           if (track && track.addEventListener) {
             track.addEventListener('ended', function () {
-              if (recordingActive) {
-                recordingActive = false;
-                emitRecordingStopped('getDisplayMedia', 'ended');
-              }
+              if (recordingActive) { recordingActive = false; emitRecStopped('getDisplayMedia', 'ended'); }
             });
           }
           return stream;
-        }).catch(function (err) { recordingActive = false; throw err; });
+        }).catch(function (e) { recordingActive = false; throw e; });
       };
     }
 
-    if (!origGetUserMedia && navigator.mediaDevices.getUserMedia) {
-      origGetUserMedia = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
-      navigator.mediaDevices.getUserMedia = function (constraints) {
+    if (!origGUM && navigator.mediaDevices.getUserMedia) {
+      origGUM = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+      navigator.mediaDevices.getUserMedia = function (c) {
         var wantsDisplay = false;
         try {
-          if (constraints && constraints.video && typeof constraints.video === 'object') {
-            var v = constraints.video;
-            if (v.mediaSource === 'screen' || v.mediaSource === 'window') wantsDisplay = true;
+          if (c && c.video && typeof c.video === 'object') {
+            if (c.video.mediaSource === 'screen' || c.video.mediaSource === 'window') wantsDisplay = true;
           }
         } catch (e) {}
-        if (wantsDisplay && CONFIG.denyGetDisplayMedia) {
+        if (wantsDisplay && CONFIG.denyScreenUserMedia) {
           RT._hit('screen-capture-denied', 'getUserMedia(screen) BLOCKED', 0);
           return Promise.reject(new DOMException(
             'Screen capture is disabled on this page.', 'NotAllowedError'));
         }
-        return origGetUserMedia(constraints).then(function (stream) {
-          RecorderGuard.trackStream(stream);
-          return stream;
-        });
+        return origGUM(c).then(function (s) { Guard.trackStream(s); return s; });
       };
     }
 
-    if (!origMediaRecorder && global.MediaRecorder) {
-      origMediaRecorder = global.MediaRecorder;
-      var Patched = function MediaRecorder(stream, opts) {
-        RecorderGuard.trackStream(stream);
-        var rec = new origMediaRecorder(stream, opts);
-        RecorderGuard.trackRecorder(rec);
+    if (!origMR && global.MediaRecorder) {
+      origMR = global.MediaRecorder;
+      var Patched = function (stream, opts) {
+        Guard.trackStream(stream);
+        var rec = new origMR(stream, opts);
+        Guard.trackRecorder(rec);
         try {
-          if (!recordingActive) {
-            recordingActive = true;
-            emitRecordingStarted('MediaRecorder', 'media-recorder-started');
-          }
+          if (!recordingActive) { recordingActive = true; emitRecStarted('MediaRecorder', 'started'); }
           var origStop = rec.stop.bind(rec);
           rec.stop = function () {
             origStop();
-            if (recordingActive) {
-              recordingActive = false;
-              emitRecordingStopped('MediaRecorder', 'media-recorder-stopped');
-            }
+            if (recordingActive) { recordingActive = false; emitRecStopped('MediaRecorder', 'stopped'); }
           };
         } catch (e) {}
         return rec;
       };
-      Patched.isTypeSupported = origMediaRecorder.isTypeSupported
-        ? origMediaRecorder.isTypeSupported.bind(origMediaRecorder)
+      Patched.isTypeSupported = origMR.isTypeSupported
+        ? origMR.isTypeSupported.bind(origMR)
         : function () { return false; };
       try { global.MediaRecorder = Patched; } catch (e) {}
     }
+
+    if (navigator.mediaDevices.addEventListener && !navigator.mediaDevices.__asBound) {
+      navigator.mediaDevices.__asBound = true;
+      navigator.mediaDevices.addEventListener('devicechange', function () { scanDevices(true); });
+    }
+  }
+
+  function scanDevices(fromChange) {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return;
+    navigator.mediaDevices.enumerateDevices().then(function (list) {
+      var c = list.length;
+      var hasDisplay = list.some(function (d) {
+        return d.kind === 'videoinput' && /display|screen|window|capture/i.test(d.label || '');
+      });
+      if (hasDisplay && !recordingActive) {
+        recordingActive = true;
+        emitRecStarted('device-enumeration', fromChange ? 'devicechange' : 'display-detected');
+      }
+      if (recListening.lastCount !== -1 && c > recListening.lastCount) {
+        try { global.dispatchEvent(new CustomEvent('as-device-added', { detail: { count: c } })); } catch (e) {}
+      }
+      recListening.lastCount = c;
+    }).catch(function () {});
   }
 
   function startDevicePoll() {
-    if (recListening.devicePollTimer || !navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return;
-    recListening.devicePollTimer = setInterval(function () {
-      navigator.mediaDevices.enumerateDevices().then(function (devices) {
-        var c = devices.length;
-        if (recListening.lastDeviceCount !== -1 && c > recListening.lastDeviceCount) {
-          var hasDisplay = devices.some(function (d) {
-            return d.kind === 'videoinput' && /display|screen|window|capture/i.test(d.label || '');
-          });
-          if (hasDisplay && !recordingActive) {
-            recordingActive = true;
-            emitRecordingStarted('device-enumeration', 'display-device-detected');
-          }
-        }
-        recListening.lastDeviceCount = c;
-      }).catch(function () {});
-    }, 3000);
+    if (recListening.pollTimer) return;
+    scanDevices(false);
+    recListening.pollTimer = setInterval(function () { scanDevices(false); }, 2500);
   }
   function stopDevicePoll() {
-    if (recListening.devicePollTimer) {
-      clearInterval(recListening.devicePollTimer);
-      recListening.devicePollTimer = null;
-    }
-    recListening.lastDeviceCount = -1;
+    if (recListening.pollTimer) clearInterval(recListening.pollTimer);
+    recListening.pollTimer = null;
+    recListening.lastCount = -1;
   }
 
-  /* ═══════════════════════════════════════════════════════════════
-     12 · DEVTOOLS SIZE-DELTA
-     ═══════════════════════════════════════════════════════════════ */
+  /* ────────────────────────────────────────────────────────────────
+     CLIPBOARD WATCHER
+     ──────────────────────────────────────────────────────────────── */
+  function checkClipboard() {
+    if (!navigator.clipboard || !navigator.clipboard.read) return;
+    navigator.clipboard.read().then(function (items) {
+      clipWatch.granted = true;
+      for (var i = 0; i < items.length; i++) {
+        var types = items[i].types || [];
+        for (var j = 0; j < types.length; j++) {
+          if (/^image\//.test(types[j])) {
+            (function (item, type) {
+              item.getType(type).then(function (blob) {
+                var h = blob.size + ':' + blob.type;
+                if (h !== clipWatch.lastHash) {
+                  clipWatch.lastHash = h;
+                  RT._hit('clipboard-image', 'Clipboard image', 2000);
+                  emitScreenshot('(clipboard)', 'clipboard watcher', 'clipboard-image');
+                }
+              }).catch(function () {});
+            })(items[i], types[j]);
+          }
+        }
+      }
+    }).catch(function () { clipWatch.granted = false; });
+  }
+  function startClipWatch() {
+    if (clipWatch.timer) return;
+    if (!navigator.clipboard || !navigator.clipboard.read) return;
+    clipWatch.timer = setInterval(checkClipboard, CONFIG.clipboardPollMs);
+  }
+  function stopClipWatch() {
+    if (clipWatch.timer) clearInterval(clipWatch.timer);
+    clipWatch.timer = null;
+  }
+
+  /* ────────────────────────────────────────────────────────────────
+     DEVTOOLS SIZE-DELTA
+     ──────────────────────────────────────────────────────────────── */
   var devtoolsArmed = false;
-  function armDevToolsDetector() {
+  function armDevTools() {
     if (devtoolsArmed) return;
     devtoolsArmed = true;
-    var THRESHOLD = 180;
+    var THRESH = 180;
     global.addEventListener('resize', function () {
-      var wDiff = Math.abs(global.outerWidth  - global.innerWidth);
-      var hDiff = Math.abs(global.outerHeight - global.innerHeight);
-      if ((wDiff > THRESHOLD || hDiff > THRESHOLD) && !manualLockActive && !locked) {
-        RT._hit('devtools-open', 'DevTools / docked panel', 1500);
+      if (!CONFIG.lockOnDevTools || Device.isMobile) return;
+      var w = Math.abs(global.outerWidth  - global.innerWidth);
+      var h = Math.abs(global.outerHeight - global.innerHeight);
+      if ((w > THRESH || h > THRESH) && !manualLock && !locked) {
+        RT._hit('devtools-open', 'DevTools panel', 1500);
       }
     });
   }
 
-  /* ═══════════════════════════════════════════════════════════════
-     13 · GLOBAL LISTENERS
-     ═══════════════════════════════════════════════════════════════ */
-  function attachGlobalListeners() {
-    if (globalListenersReady) return;
-    globalListenersReady = true;
+  /* ────────────────────────────────────────────────────────────────
+     GLOBAL LISTENERS
+     ──────────────────────────────────────────────────────────────── */
+  function attachListeners() {
+    if (listenersReady) return;
+    listenersReady = true;
 
     injectCSS();
     buildShield();
-    applyMode(currentMode, currentBlurRadius, currentColor);
+    applyMode(CONFIG.mode, CONFIG.blurRadius, CONFIG.color);
     patchCaptureApis();
-    armDevToolsDetector();
+    armDevTools();
 
+    /* visibility (app switch, home, lock screen) */
     document.addEventListener('visibilitychange', function () {
       if (document.hidden) {
-        if (!manualLockActive) RT._hit('visibility-hidden', 'Tab hidden');
-      } else if (!manualLockActive) {
-        RecorderGuard.startCooldown();
+        if (!manualLock) RT._hit('visibility-hidden', 'Hidden');
+      } else if (!manualLock) {
+        Guard.startCooldown();
         tryUnlock();
+        if (CONFIG.watchClipboard) setTimeout(checkClipboard, 120);
       }
     });
 
+    /* window blur/focus */
     global.addEventListener('blur', function () {
-      if (!manualLockActive && !locked) RT._hit('window-blur', 'Window blur');
-      else if (!manualLockActive) RecorderGuard.startCooldown();
+      if (!manualLock && !locked) RT._hit('window-blur', 'Window blur');
+      else if (!manualLock) Guard.startCooldown();
     });
     global.addEventListener('focus', function () {
       everFocused = true;
-      RecorderGuard.startCooldown();
+      Guard.startCooldown();
       tryUnlock();
-    });
-    global.addEventListener('pagehide', function () {
-      if (!manualLockActive) RT._hit('pagehide', 'Page hide');
-    });
-    global.addEventListener('pageshow', function () {
-      RecorderGuard.startCooldown();
-      tryUnlock();
-    });
-    document.addEventListener('freeze', function () {
-      if (!manualLockActive) RT._hit('freeze', 'Page freeze');
-    });
-    document.addEventListener('resume', function () {
-      RecorderGuard.startCooldown();
-      tryUnlock();
+      if (CONFIG.watchClipboard) setTimeout(checkClipboard, 120);
     });
 
+    /* page lifecycle */
+    global.addEventListener('pagehide', function () {
+      if (!manualLock) RT._hit('pagehide', 'Page hide');
+    });
+    global.addEventListener('pageshow', function () {
+      Guard.startCooldown(); tryUnlock();
+    });
+    document.addEventListener('freeze', function () {
+      if (!manualLock) RT._hit('freeze', 'Page freeze');
+    });
+    document.addEventListener('resume', function () {
+      Guard.startCooldown(); tryUnlock();
+    });
+
+    /* keyboard */
     document.addEventListener('keydown', onKeyDown, true);
     document.addEventListener('keyup',   onKeyUp,   true);
 
+    /* print */
     global.addEventListener('beforeprint', function () {
-      if (!manualLockActive) RT._hit('print', 'beforeprint');
+      if (!manualLock) RT._hit('print', 'beforeprint');
     });
     global.addEventListener('afterprint', function () {
-      RecorderGuard.startCooldown();
-      tryUnlock();
+      Guard.startCooldown(); tryUnlock();
     });
 
+    /* copy / context */
     document.addEventListener('contextmenu', function (e) {
-      if (isProtectedNode(e.target)) e.preventDefault();
+      if (isGuarded(e.target)) e.preventDefault();
     });
     document.addEventListener('copy', function (e) {
-      if (isProtectedNode(e.target)) {
-        e.preventDefault();
-        RT._hit('copy-blocked', 'Copy on protected node', 900);
-      }
+      if (isGuarded(e.target)) { e.preventDefault(); RT._hit('copy-blocked', 'Copy blocked', 900); }
     });
     document.addEventListener('cut', function (e) {
-      if (isProtectedNode(e.target)) e.preventDefault();
+      if (isGuarded(e.target)) e.preventDefault();
     });
 
+    /* multi-touch (Android 3-finger screenshot, tablet gestures) */
     if (CONFIG.lockOnMultiTouch) {
       document.addEventListener('touchstart', function (e) {
         if (e.touches && e.touches.length >= 3) {
           RT._hit('multi-touch', '3-finger gesture', 2000);
-          emitScreenshot('(android)', '3-finger gesture', 'multi-touch');
+          emitScreenshot('(touch)', '3-finger gesture', 'multi-touch');
         }
       }, { passive: true, capture: true });
     }
 
-    everFocused = safeHasFocus();
+    /* orientation change (mobile / tablet) */
+    if (CONFIG.lockOnOrientationChange) {
+      var orientHandler = function () {
+        var cur = (screen.orientation && screen.orientation.type) || '';
+        if (cur && cur !== orientationLast) {
+          orientationLast = cur;
+          if (!manualLock) RT._hit('orientation-change', 'Orientation change', 800);
+        }
+      };
+      if (screen.orientation && screen.orientation.addEventListener) {
+        screen.orientation.addEventListener('change', orientHandler);
+      } else {
+        global.addEventListener('orientationchange', orientHandler);
+      }
+    }
+
+    /* clipboard change (modern) */
+    if (CONFIG.watchClipboard) {
+      try {
+        if (navigator.clipboard && 'onclipboardchange' in navigator.clipboard) {
+          navigator.clipboard.onclipboardchange = function (ev) {
+            if (ev && ev.types && ev.types.indexOf('image/png') !== -1) {
+              RT._hit('clipboard-change', 'Clipboard image changed', 2000);
+              emitScreenshot('(clipboard)', 'clipboardchange', 'clipboard-image');
+            }
+          };
+        }
+      } catch (e) {}
+    }
+
+    /* stylus button (Surface, iPad Pencil, Android stylus) */
+    if (CONFIG.lockOnStylusButton) {
+      document.addEventListener('pointerdown', function (e) {
+        if (e.pointerType === 'pen' && (e.buttons & 2 || e.buttons & 32)) {
+          RT._hit('stylus-button', 'Stylus button', 1500);
+        }
+      }, { passive: true, capture: true });
+    }
+
+    everFocused = hasFocus();
     if (document.hidden) RT._hit('init-hidden', 'Started hidden');
 
     ['pointerdown', 'touchstart', 'keydown', 'click'].forEach(function (ev) {
       global.addEventListener(ev, function () {
-        userInteracted = true;
         everFocused = true;
       }, { once: true, capture: true });
     });
   }
 
-  /* ═══════════════════════════════════════════════════════════════
-     14 · PUBLIC WIDGET
-     ═══════════════════════════════════════════════════════════════ */
-  function SecureWidget(opts) {
-    opts = opts || {};
-    var mode       = opts.mode || OverlayMode.blur;
-    var blurRadius = (opts.blurRadius != null) ? opts.blurRadius : 28;
-    var color      = (opts.color != null) ? opts.color : 0xFF000000;
-    var child      = opts.child;
-
-    var el;
-    if (typeof child === 'string') el = document.querySelector(child);
-    else if (child instanceof Element) el = child;
-    else if (child && child.el) el = child.el;
-
-    if (!el) { console.warn('[SecureWidget] child not found:', child); return null; }
-
-    attachGlobalListeners();
-    el.classList.add('as-protected');
-    applyMode(mode, blurRadius, color);
-
-    var inst = {
-      el: el, mode: mode, blurRadius: blurRadius, color: color,
-      setMode: function (m, r, c) {
-        this.mode = m;
-        applyMode(m, r != null ? r : this.blurRadius, c != null ? c : this.color);
-      },
-      destroy: function () { el.classList.remove('as-protected'); }
-    };
-    instances.push(inst);
-    return inst;
+  /* ────────────────────────────────────────────────────────────────
+     PROTECT ELEMENTS
+     ──────────────────────────────────────────────────────────────── */
+  function protect(el) {
+    if (!el || protectedEls.has(el)) return;
+    protectedEls.add(el);
+    el.classList.add('as-guarded');
+    elementList.push(el);
   }
 
-  function init(opts) { return SecureWidget(opts || {}); }
-
-  function autoInit() {
-    var nodes = document.querySelectorAll('[data-anti-screenshot]');
-    for (var i = 0; i < nodes.length; i++) {
-      var n = nodes[i];
-      if (n.__asBound) continue;
-      n.__asBound = true;
-      attachGlobalListeners();
-      n.classList.add('as-protected');
-      instances.push({ el: n, config: {} });
-    }
+  function protectBySelector(sel) {
+    var nodes = document.querySelectorAll(sel);
+    for (var i = 0; i < nodes.length; i++) protect(nodes[i]);
+    return nodes.length;
   }
 
+  function protectAll() {
+    protectBySelector('[data-anti-screenshot]');
+  }
+
+  /* ────────────────────────────────────────────────────────────────
+     AUTO-ARM / DISARM
+     ──────────────────────────────────────────────────────────────── */
+  function arm() {
+    if (autoArmed) return;
+    autoArmed = true;
+    if (!listenersReady) attachListeners();
+    protectAll();
+    RT.start();
+    patchCaptureApis();
+    startDevicePoll();
+    if (CONFIG.watchClipboard) startClipWatch();
+    recListening.active = true;
+    try { global.dispatchEvent(new CustomEvent('as-armed', { detail: { version: VERSION, device: Device.summary } })); } catch (e) {}
+  }
+
+  function disarm() {
+    autoArmed = false;
+    RT.stop();
+    stopDevicePoll();
+    stopClipWatch();
+    recListening.active = false;
+    try { global.dispatchEvent(new CustomEvent('as-disarmed', {})); } catch (e) {}
+  }
+
+  /* ────────────────────────────────────────────────────────────────
+     MUTATION OBSERVER  (auto-protect newly injected nodes)
+     ──────────────────────────────────────────────────────────────── */
+  var mo = null;
+  function startObserver() {
+    if (mo || !global.MutationObserver) return;
+    mo = new MutationObserver(function (mutations) {
+      var added = false;
+      for (var i = 0; i < mutations.length; i++) {
+        var m = mutations[i];
+        for (var j = 0; j < m.addedNodes.length; j++) {
+          var n = m.addedNodes[j];
+          if (n.nodeType !== 1) continue;
+          if (n.hasAttribute && n.hasAttribute('data-anti-screenshot')) { protect(n); added = true; }
+          if (n.querySelectorAll) {
+            var kids = n.querySelectorAll('[data-anti-screenshot]');
+            for (var k = 0; k < kids.length; k++) { protect(kids[k]); added = true; }
+          }
+        }
+      }
+      if (added) {
+        try { global.dispatchEvent(new CustomEvent('as-protected', { detail: { total: elementList.length } })); } catch (e) {}
+      }
+    });
+    mo.observe(document.documentElement, { childList: true, subtree: true });
+  }
+
+  /* ────────────────────────────────────────────────────────────────
+     BOOT
+     ──────────────────────────────────────────────────────────────── */
   function boot() {
     injectCSS();
-    autoInit();
-    RT.start();
-    attachGlobalListeners();
-    if (CONFIG.autoStartRecordingListener) {
-      NoScreenshot.instance.startScreenRecordingListening();
+    if (CONFIG.autoArm) {
+      arm();
+      startObserver();
+    } else {
+      protectAll();
+      attachListeners();
+      RT.start();
     }
   }
 
@@ -4743,205 +4845,97 @@ if (document.addEventListener) {
     boot();
   }
 
-  /* ═══════════════════════════════════════════════════════════════
-     15 · NOSCREENSHOT SINGLETON  —  DART-STYLE API
-     ═══════════════════════════════════════════════════════════════ */
-  var NoScreenshot = (function () {
+  /* ────────────────────────────────────────────────────────────────
+     PUBLIC API
+     ──────────────────────────────────────────────────────────────── */
+  var instance = {
+    /* Dart-style stream */
+    screenshotStream:              screenshotStream,
+    startScreenRecordingListening: function () {
+      try { if (!listenersReady) attachListeners(); patchCaptureApis(); startDevicePoll(); recListening.active = true; return Promise.resolve(true); }
+      catch (e) { return Promise.resolve(false); }
+    },
+    stopScreenRecordingListening:  function () {
+      try { stopDevicePoll(); recListening.active = false; return Promise.resolve(true); }
+      catch (e) { return Promise.resolve(false); }
+    },
+    isScreenRecordingListening:    function () { return recListening.active; },
 
-    /* ── screenshotOff / On / toggle ── */
-    function _off() {
-      try {
-        if (!globalListenersReady) attachGlobalListeners();
-        lock('screenshot-off', 0, true);
-        return Promise.resolve(true);
-      } catch (e) { console.error('[NoScreenshot] screenshotOff failed:', e); return Promise.resolve(false); }
-    }
-    function _on() {
-      try { unlock(); return Promise.resolve(true); }
-      catch (e) { console.error('[NoScreenshot] screenshotOn failed:', e); return Promise.resolve(false); }
-    }
-    function _toggle() { return (locked ? _on() : _off()).then(function () { return true; }); }
+    startClipboardWatch:           function () { try { startClipWatch(); return Promise.resolve(true); } catch (e) { return Promise.resolve(false); } },
+    stopClipboardWatch:            function () { try { stopClipWatch();  return Promise.resolve(true); } catch (e) { return Promise.resolve(false); } },
+    isClipboardWatching:           function () { return !!clipWatch.timer; },
 
-    /* ── callback plumbing ── */
-    function _startCbs() {
-      callbacksActive = true;
-      try { global.dispatchEvent(new CustomEvent('as-callbacks', { detail: { active: true } })); } catch (e) {}
-      return Promise.resolve(true);
-    }
-    function _stopCbs() {
-      callbacksActive = false;
-      try { global.dispatchEvent(new CustomEvent('as-callbacks', { detail: { active: false } })); } catch (e) {}
-      return Promise.resolve(true);
-    }
-    function _removeAllCbs() {
-      callbacks.onScreenshotDetected = null;
-      callbacks.onScreenRecordingStarted = null;
-      callbacks.onScreenRecordingStopped = null;
-      callbacksActive = false;
-      return Promise.resolve(true);
-    }
+    armAutoDetect:                 function () { try { arm();    return Promise.resolve(true); } catch (e) { return Promise.resolve(false); } },
+    disarmAutoDetect:              function () { try { disarm(); return Promise.resolve(true); } catch (e) { return Promise.resolve(false); } },
+    isAutoArmed:                   function () { return autoArmed; },
 
-    /* ── START SCREEN-RECORDING LISTENING ── */
-    function _startScreenRecordingListening() {
-      try {
-        if (!globalListenersReady) attachGlobalListeners();
-        patchCaptureApis();          /* idempotent */
-        startDevicePoll();           /* idempotent */
-        recListening.active = true;
-        try {
-          global.dispatchEvent(new CustomEvent('as-recording-listening', {
-            detail: { active: true }
-          }));
-        } catch (e) {}
-        return Promise.resolve(true);
-      } catch (e) {
-        console.error('[NoScreenshot] startScreenRecordingListening failed:', e);
-        return Promise.resolve(false);
-      }
-    }
+    screenshotOff:                 function () { try { if (!listenersReady) attachListeners(); lock('screenshot-off', 0, true); return Promise.resolve(true); } catch (e) { return Promise.resolve(false); } },
+    screenshotOn:                  function () { try { unlock(); return Promise.resolve(true); } catch (e) { return Promise.resolve(false); } },
+    toggleScreenshot:              function () { return (locked ? instance.screenshotOn() : instance.screenshotOff()).then(function () { return true; }); },
+    isScreenshotOff:               function () { return locked; },
 
-    /* ── STOP SCREEN-RECORDING LISTENING ── */
-    function _stopScreenRecordingListening() {
-      try {
-        stopDevicePoll();
-        recListening.active = false;
-        try {
-          global.dispatchEvent(new CustomEvent('as-recording-listening', {
-            detail: { active: false }
-          }));
-        } catch (e) {}
-        return Promise.resolve(true);
-      } catch (e) {
-        console.error('[NoScreenshot] stopScreenRecordingListening failed:', e);
-        return Promise.resolve(false);
-      }
-    }
+    protect:                       protect,
+    protectAll:                    protectAll,
+    protectBySelector:             protectBySelector,
 
-    /* ── the singleton instance ── */
-    var instance = {
-      /* ── primary Dart-style surface ── */
-      screenshotStream:          screenshotStream,
-      startScreenRecordingListening: _startScreenRecordingListening,
-      stopScreenRecordingListening:  _stopScreenRecordingListening,
-      isScreenRecordingListening:    function () { return recListening.active; },
+    isRecording:                   function () { return Guard.hasActive(); },
+    getGuardReasons:               function () { return Guard.reasons(); },
+    getDeviceInfo:                 function () { return Device; },
+    getStats:                      function () { return RT.stats(); }
+  };
 
-      /* ── lock API ── */
-      screenshotOff: _off,
-      screenshotOn:  _on,
-      toggleScreenshot: _toggle,
-      isScreenshotOff: function () { return locked; },
-
-      /* ── legacy callback API (kept for backwards compat) ── */
-      startCallbacks:     _startCbs,
-      stopCallbacks:      _stopCbs,
-      removeAllCallbacks: _removeAllCbs,
-      isCallbacksActive:  function () { return callbacksActive; },
-
-      get onScreenshotDetected()     { return callbacks.onScreenshotDetected; },
-      set onScreenshotDetected(fn)   { callbacks.onScreenshotDetected = (typeof fn === 'function') ? fn : null; },
-      get onScreenRecordingStarted() { return callbacks.onScreenRecordingStarted; },
-      set onScreenRecordingStarted(fn) { callbacks.onScreenRecordingStarted = (typeof fn === 'function') ? fn : null; },
-      get onScreenRecordingStopped() { return callbacks.onScreenRecordingStopped; },
-      set onScreenRecordingStopped(fn) { callbacks.onScreenRecordingStopped = (typeof fn === 'function') ? fn : null; },
-
-      /* ── introspective helpers ── */
-      isRecording: function () { return RecorderGuard.hasActiveCapture(); },
-      getGuardReasons: function () { return RecorderGuard.getReasons(); }
-    };
-
-    return {
-      version: VERSION,
-      instance: instance,
-
-      /* ── test hooks ── */
-      _simulateScreenshot: function () { emitScreenshot('(simulated)', 'demo', 'sim'); },
-      _simulateRecordingStarted: function () { emitRecordingStarted('demo', 'sim'); },
-      _simulateRecordingStopped: function () { emitRecordingStopped('demo', 'sim'); }
-    };
-  })();
-
-  /* ═══════════════════════════════════════════════════════════════
-     16 · GLOBAL EXPORT
-     ═══════════════════════════════════════════════════════════════ */
   global.AntiScreenshot = {
-    version: VERSION,
-    OverlayMode: OverlayMode,
-    SecureWidget: SecureWidget,
-    Stream: Stream,
-    Snapshot: Snapshot,
-    init: init,
-    lock: lock,
-    unlock: unlock,
-    isLocked: function () { return locked; },
-    setMode: applyMode,
-    instances: instances,
-    realtime: RT,
-    recorderGuard: RecorderGuard,
-    screenshotStream: screenshotStream,
+    version:      VERSION,
+    OverlayMode:  OverlayMode,
+    Device:       Device,
+    instance:     instance,
+    Stream:       Stream,
+    Snapshot:     Snapshot,
+
+    init:              function (opts) { if (opts) applyMode(opts.mode, opts.blurRadius, opts.color); return instance; },
+    lock:              lock,
+    unlock:            unlock,
+    isLocked:          function () { return locked; },
+    setMode:           applyMode,
+
+    protect:           protect,
+    protectBySelector: protectBySelector,
+    protectAll:        protectAll,
+
+    armAutoDetect:     function () { arm(); },
+    disarmAutoDetect:  function () { disarm(); },
 
     configure: function (opts) {
       opts = opts || {};
-      if (typeof opts.cooldownMs === 'number')            CONFIG.cooldownMs = opts.cooldownMs;
-      if (typeof opts.denyGetDisplayMedia === 'boolean')  CONFIG.denyGetDisplayMedia = opts.denyGetDisplayMedia;
-      if (typeof opts.lockOnFocusLoss === 'boolean')      CONFIG.lockOnFocusLoss = opts.lockOnFocusLoss;
-      if (typeof opts.lockOnHidden === 'boolean')         CONFIG.lockOnHidden = opts.lockOnHidden;
-      if (typeof opts.lockOnMultiTouch === 'boolean')     CONFIG.lockOnMultiTouch = opts.lockOnMultiTouch;
-      if (typeof opts.autoStartRecordingListener === 'boolean') CONFIG.autoStartRecordingListener = opts.autoStartRecordingListener;
-      if (typeof opts.pollIntervalMs === 'number') {
-        CONFIG.pollIntervalMs = opts.pollIntervalMs;
-        if (RT.isActive()) { RT.stop(); RT.start(); }
-      }
+      var keys = ['cooldownMs','maxAutoUnlockMs','realtimePollMs','clipboardPollMs',
+                  'denyGetDisplayMedia','denyScreenUserMedia','lockOnFocusLoss',
+                  'lockOnHidden','lockOnMultiTouch','lockOnDevTools','lockOnOrientationChange',
+                  'lockOnStylusButton','watchClipboard','autoArm','blurRadius','color','mode'];
+      keys.forEach(function (k) {
+        if (typeof opts[k] !== 'undefined') CONFIG[k] = opts[k];
+      });
+      applyMode(CONFIG.mode, CONFIG.blurRadius, CONFIG.color);
+      if (CONFIG.watchClipboard) startClipWatch(); else stopClipWatch();
       return CONFIG;
     },
     getConfig: function () { return CONFIG; },
 
     destroy: function () {
-      instances.forEach(function (i) { if (i.el) i.el.classList.remove('as-protected'); });
-      instances.length = 0;
-      unlock();
-      RT.stop();
-      NoScreenshot.instance.stopScreenRecordingListening();
+      disarm();
+      elementList.forEach(function (el) { if (el && el.classList) el.classList.remove('as-guarded'); });
+      elementList.length = 0;
+      if (mo) { mo.disconnect(); mo = null; }
       if (shieldEl && shieldEl.parentNode) shieldEl.parentNode.removeChild(shieldEl);
       shieldEl = null;
+      unlock();
+      global.__AS_PREMIUM__ = false;
     }
   };
 
-  global.NoScreenshot = NoScreenshot;
-  global.OverlayMode  = OverlayMode;
-  global.SecureWidget = SecureWidget;
+  /* aliases */
+  global.NoScreenshot = { version: VERSION, instance: instance };
 
 })(window);
-
-
-/* ══════════════════════════════════════════════════════════════
-   USAGE — Dart-style, exactly mirrors the Flutter snippet:
-   ══════════════════════════════════════════════════════════════ */
-(function () {
-  var _noScreenshot = NoScreenshot.instance;
-
-  // 1. Subscribe to the stream (same stream as screenshot events)
-  var _sub = _noScreenshot.screenshotStream.listen(function (snapshot) {
-    if (snapshot.isScreenRecording) {
-      console.log('Screen is being recorded!', snapshot.type);
-    }
-    if (snapshot.isScreenshot) {
-      console.log('Screenshot detected:', snapshot.screenshotPath);
-    }
-  });
-
-  // 2. Start recording monitoring
-  _noScreenshot.startScreenRecordingListening().then(function (ok) {
-    console.log('[AntiScreenshot] recording listening:', ok);
-  });
-
-  // 3. Stop recording monitoring when no longer needed
-  // _noScreenshot.stopScreenRecordingListening().then(function (ok) {
-  //   console.log('[AntiScreenshot] recording listening stopped:', ok);
-  // });
-
-  // 4. Cancel subscription
-  // _sub.cancel();
-})();
 </script>
       
 </body>
